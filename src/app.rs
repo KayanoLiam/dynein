@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use ::serde::{Deserialize, Serialize};
+use ::serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use aws_config::{
     meta::region::RegionProviderChain, retry::RetryConfig, BehaviorVersion, Region, SdkConfig,
 };
@@ -134,9 +134,87 @@ impl TryFrom<RetrySettingGlobal> for Retry {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RetrySetting {
+    #[serde(default, deserialize_with = "deserialize_option_duration")]
     pub initial_backoff: Option<Duration>,
+    #[serde(default, deserialize_with = "deserialize_option_duration")]
     pub max_backoff: Option<Duration>,
     pub max_attempts: Option<u32>,
+}
+
+/// Accepts several human-readable duration forms for retry backoff.
+///
+/// * integer or float: seconds (`2`, `0.5`)
+/// * string with a unit (`100ms`, `0.1s`, `20s`)
+/// * std `Duration` mapping (`secs` / `nanos`) for backward compatibility
+fn deserialize_option_duration<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // Untagged enum as suggested in https://github.com/awslabs/dynein/issues/225
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum DurationConf {
+        Seconds(u64),
+        FloatSeconds(f64),
+        Std(Duration),
+        Raw(String),
+    }
+
+    Option::<DurationConf>::deserialize(deserializer)?
+        .map(|conf| match conf {
+            DurationConf::Seconds(secs) => Ok(Duration::from_secs(secs)),
+            DurationConf::FloatSeconds(secs) => duration_from_secs_f64(secs),
+            DurationConf::Std(duration) => Ok(duration),
+            DurationConf::Raw(raw) => parse_human_duration(&raw),
+        })
+        .transpose()
+        .map_err(DeError::custom)
+}
+
+fn duration_from_secs_f64(secs: f64) -> Result<Duration, String> {
+    if !secs.is_finite() {
+        return Err(format!(
+            "duration must be a finite number of seconds, got {secs}"
+        ));
+    }
+    if secs < 0.0 {
+        return Err(format!("duration must not be negative, got {secs}"));
+    }
+    Duration::try_from_secs_f64(secs).map_err(|e| format!("duration is out of range: {e}"))
+}
+
+fn parse_human_duration(input: &str) -> Result<Duration, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("duration must not be empty".to_string());
+    }
+
+    let unit_start = input
+        .char_indices()
+        .find(|(_, c)| c.is_ascii_alphabetic() || *c == 'µ' || *c == 'μ')
+        .map(|(i, _)| i);
+    let (number, unit) = match unit_start {
+        Some(i) => (input[..i].trim(), input[i..].trim()),
+        None => (input, ""),
+    };
+    if number.is_empty() {
+        return Err(format!("duration is missing a number: '{input}'"));
+    }
+
+    let value: f64 = number
+        .parse()
+        .map_err(|_| format!("invalid duration '{input}'"))?;
+    let unit_norm = unit.to_ascii_lowercase();
+    let seconds = match unit_norm.as_str() {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => value,
+        "ms" | "msec" | "millis" | "millisecond" | "milliseconds" => value / 1_000.0,
+        "us" | "µs" | "μs" | "microsecond" | "microseconds" => value / 1_000_000.0,
+        "ns" | "nanosecond" | "nanoseconds" => value / 1_000_000_000.0,
+        "m" | "min" | "mins" | "minute" | "minutes" => value * 60.0,
+        "h" | "hr" | "hrs" | "hour" | "hours" => value * 3_600.0,
+        _ => return Err(format!("unknown duration unit '{unit}'")),
+    };
+    duration_from_secs_f64(seconds)
 }
 
 impl Default for RetrySetting {
@@ -896,6 +974,71 @@ mod tests {
         match RetryConfig::try_from(config).unwrap_err() {
             RetryConfigError::MaxBackoff => {}
             _ => unreachable!("unexpected error"),
+        }
+    }
+
+    #[test]
+    fn test_retry_backoff_human_readable_yaml() {
+        let cases: &[(&str, Duration)] = &[
+            ("0.5", Duration::from_millis(500)),
+            ("0.1s", Duration::from_millis(100)),
+            ("100ms", Duration::from_millis(100)),
+            ("2", Duration::from_secs(2)),
+            ("1s", Duration::from_secs(1)),
+            ("1.5s", Duration::from_millis(1500)),
+            ("\"100ms\"", Duration::from_millis(100)),
+            ("\"100 ms\"", Duration::from_millis(100)),
+            ("20s", Duration::from_secs(20)),
+        ];
+
+        for (value, expected) in cases {
+            let yaml = format!("default:\n  initial_backoff: {value}\n");
+            let parsed: RetrySettingGlobal = serde_yaml::from_str(&yaml)
+                .unwrap_or_else(|err| panic!("failed to parse {}: {}", value, err));
+            assert_eq!(
+                parsed.default.initial_backoff,
+                Some(*expected),
+                "input: {}",
+                value
+            );
+        }
+
+        let legacy = r#"
+default:
+  initial_backoff:
+    secs: 0
+    nanos: 500000000
+"#;
+        let parsed: RetrySettingGlobal = serde_yaml::from_str(legacy).unwrap();
+        assert_eq!(
+            parsed.default.initial_backoff,
+            Some(Duration::from_millis(500))
+        );
+
+        let yaml = r#"
+default:
+  initial_backoff: 100ms
+  max_backoff: 20s
+  max_attempts: 8
+"#;
+        let parsed: RetrySettingGlobal = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            parsed.default.initial_backoff,
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(parsed.default.max_backoff, Some(Duration::from_secs(20)));
+        assert_eq!(parsed.default.max_attempts, Some(8));
+    }
+
+    #[test]
+    fn test_retry_backoff_invalid_yaml() {
+        for value in ["-1", "abc", "1x", "ms"] {
+            let yaml = format!("default:\n  initial_backoff: {value}\n");
+            assert!(
+                serde_yaml::from_str::<RetrySettingGlobal>(&yaml).is_err(),
+                "expected error for {}",
+                value
+            );
         }
     }
 }

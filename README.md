@@ -423,6 +423,16 @@ using_region: ap-northeast-1
 using_table: customers
 ```
 
+Retry backoff in `config.yml` accepts human-readable durations as well as the legacy `secs`/`nanos` mapping:
+
+```yaml
+retry:
+  default:
+    initial_backoff: 100ms   # also: 0.5, 0.1s, or {secs: 0, nanos: 500000000}
+    max_backoff: 20s
+    max_attempts: 10
+```
+
 To clear current table configuration, simply execute `dy config clear`.
 
 ```
